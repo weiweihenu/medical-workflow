@@ -1,27 +1,35 @@
 from __future__ import annotations
 
+import asyncio
+import importlib
 import json
 import os
 import queue
 import threading
 import time
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import requests
 import streamlit as st
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-UPLOAD_URL = f"{API_BASE_URL}/api/documents/upload"
-STREAM_URL = f"{API_BASE_URL}/api/consult/stream"
-
+BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
+AUTO_START_BACKEND = os.getenv("AUTO_START_BACKEND", "1") == "1"
+BACKEND_APP_IMPORT = os.getenv("BACKEND_APP_IMPORT", "main:app")
 MAX_SILENCE_SECONDS = int(os.getenv("UI_MAX_SILENCE_SECONDS", "120"))
 
-ANIM_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-PULSE_FRAMES = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"]
+API_BASE_URL = os.getenv("API_BASE_URL", f"http://{BACKEND_HOST}:{BACKEND_PORT}").rstrip("/")
+UPLOAD_URL = f"{API_BASE_URL}/api/documents/upload"
+STREAM_URL = f"{API_BASE_URL}/api/consult/stream"
+HEALTH_PATHS = ("/api/health", "/health")
+
+SPINNER_FRAMES = ["-", "\\", "|", "/"]
+PULSE_FRAMES = [".", "..", "...", "....", "...", ".."]
 
 STARTUP_MESSAGE = (
     "你好，我是智能医疗问诊助手。\n"
+    "我会按“询问 -> 路由 -> 专科 -> 总结”流程分析你的情况。\n"
     "请先描述主要症状、持续时间、严重程度。"
 )
 
@@ -52,7 +60,7 @@ def _build_live_status_text(
     total_elapsed = _format_duration(now - workflow_start_at)
     idle_elapsed = _format_duration(now - last_backend_event_at)
 
-    spinner = ANIM_FRAMES[frame_index % len(ANIM_FRAMES)]
+    spinner = SPINNER_FRAMES[frame_index % len(SPINNER_FRAMES)]
     pulse = PULSE_FRAMES[frame_index % len(PULSE_FRAMES)]
 
     text = (
@@ -64,13 +72,86 @@ def _build_live_status_text(
     return text
 
 
+def _backend_health_ok(timeout: float = 1.0) -> bool:
+    for health_path in HEALTH_PATHS:
+        health_url = f"{API_BASE_URL}{health_path}"
+        try:
+            response = requests.get(health_url, timeout=timeout)
+            if response.ok:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_backend_ready(max_wait_seconds: float = 35.0, interval_seconds: float = 0.5) -> bool:
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
+        if _backend_health_ok(timeout=1.0):
+            return True
+        time.sleep(interval_seconds)
+    return False
+
+
+def _load_backend_app():
+    if ":" not in BACKEND_APP_IMPORT:
+        raise ValueError("BACKEND_APP_IMPORT 格式必须是 module:app")
+    module_name, app_name = BACKEND_APP_IMPORT.split(":", 1)
+    module = importlib.import_module(module_name)
+    app = getattr(module, app_name)
+    return app
+
+
+@st.cache_resource(show_spinner=False)
+def _start_backend_thread_once() -> str:
+    from uvicorn import Config, Server
+
+    backend_app = _load_backend_app()
+
+    def _run_server() -> None:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        config = Config(
+            app=backend_app,
+            host=BACKEND_HOST,
+            port=BACKEND_PORT,
+            log_level="warning",
+            reload=False,
+        )
+        Server(config).run()
+
+    thread = threading.Thread(target=_run_server, name="fastapi-local-thread", daemon=True)
+    thread.start()
+    return "started"
+
+
+def _ensure_backend_ready() -> Tuple[bool, str]:
+    if _backend_health_ok(timeout=0.8):
+        return True, f"后端已就绪（{API_BASE_URL}）"
+
+    if not AUTO_START_BACKEND:
+        return False, "未检测到可用后端，且 AUTO_START_BACKEND=0"
+
+    try:
+        _start_backend_thread_once()
+    except Exception as exc:
+        return False, f"自动拉起后端失败：{exc}"
+
+    if _wait_backend_ready(max_wait_seconds=35.0, interval_seconds=0.5):
+        return True, f"后端已自动拉起（{API_BASE_URL}）"
+
+    return False, "后端启动超时（35秒）"
+
+
 def _init_state() -> None:
     if "session_id" not in st.session_state:
         st.session_state.session_id = _new_session_id()
+
     if "messages" not in st.session_state:
         st.session_state.messages = [{"role": "assistant", "content": STARTUP_MESSAGE}]
+
     if "uploaded_docs" not in st.session_state:
         st.session_state.uploaded_docs = []
+
     if "state_snapshot" not in st.session_state:
         st.session_state.state_snapshot = {}
 
@@ -83,9 +164,12 @@ def _reset_case() -> None:
 
 
 def _upload_documents(files) -> Dict[str, Any]:
+    if not files:
+        return {"documents": []}
+
     multipart_files = [
-        ("files", (f.name, f.getvalue(), f.type or "application/octet-stream"))
-        for f in files
+        ("files", (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "application/octet-stream"))
+        for uploaded_file in files
     ]
 
     response = requests.post(
@@ -99,13 +183,13 @@ def _upload_documents(files) -> Dict[str, Any]:
     return response.json()
 
 
-def _stream_worker(session_id: str, user_input: str, out_q) -> None:
+def _stream_worker(session_id: str, user_input: str, out_queue: "queue.Queue[Dict[str, Any]]") -> None:
     payload = {"session_id": session_id, "user_input": user_input}
 
     try:
         with requests.post(STREAM_URL, json=payload, stream=True, timeout=(20, 600)) as response:
             if not response.ok:
-                out_q.put({"type": "error", "message": f"请求失败({response.status_code}): {response.text}"})
+                out_queue.put({"type": "error", "message": f"请求失败({response.status_code}): {response.text}"})
                 return
 
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -126,12 +210,12 @@ def _stream_worker(session_id: str, user_input: str, out_q) -> None:
                     continue
 
                 if isinstance(event, dict):
-                    out_q.put(event)
+                    out_queue.put(event)
 
     except Exception as exc:
-        out_q.put({"type": "error", "message": f"流式连接异常: {exc}"})
+        out_queue.put({"type": "error", "message": f"流式连接异常: {exc}"})
     finally:
-        out_q.put({"type": "_worker_done"})
+        out_queue.put({"type": "_worker_done"})
 
 
 def _render_sidebar_snapshot(snapshot: Dict[str, Any]) -> None:
@@ -144,13 +228,27 @@ def _render_sidebar_snapshot(snapshot: Dict[str, Any]) -> None:
 
 
 st.set_page_config(page_title="智能医疗问诊", page_icon="🩺", layout="wide")
+
+backend_ready, backend_message = _ensure_backend_ready()
+if not backend_ready:
+    st.error(
+        "后端未就绪。\n\n"
+        f"原因：{backend_message}\n\n"
+        "请检查：\n"
+        "1) BACKEND_APP_IMPORT 是否正确（默认 main:app）\n"
+        "2) 是否已安装 uvicorn\n"
+        "3) 或设置 API_BASE_URL 指向已启动后端"
+    )
+    st.stop()
+
 _init_state()
 
-st.title("🩺 智能医疗问诊")
+st.title("🩺 智能医疗问诊（单文件部署 + 活性流式状态）")
 
 with st.sidebar:
     st.subheader("会话")
     st.caption(f"Session ID: `{st.session_state.session_id}`")
+    st.caption(f"Backend: `{backend_message}`")
 
     if st.button("🆕 新病例", use_container_width=True):
         _reset_case()
@@ -167,19 +265,19 @@ with st.sidebar:
 
     if st.button("📤 上传并解析", use_container_width=True, disabled=not upload_files):
         try:
-            result = _upload_documents(upload_files)
-            docs = result.get("documents", [])
-            if isinstance(docs, list):
-                st.session_state.uploaded_docs.extend(docs)
-            st.success(f"上传成功: 新增 {len(docs)} 份材料")
+            upload_result = _upload_documents(upload_files)
+            documents = upload_result.get("documents", [])
+            if isinstance(documents, list):
+                st.session_state.uploaded_docs.extend(documents)
+            st.success(f"上传成功: 新增 {len(documents)} 份材料")
         except Exception as exc:
             st.error(f"上传失败: {exc}")
 
     if st.session_state.uploaded_docs:
         st.markdown("**已接入材料**")
-        for doc in st.session_state.uploaded_docs[-10:]:
-            filename = doc.get("filename", "unnamed")
-            char_count = doc.get("char_count", 0)
+        for document in st.session_state.uploaded_docs[-10:]:
+            filename = document.get("filename", "unnamed")
+            char_count = document.get("char_count", 0)
             st.caption(f"- {filename} ({char_count} 字)")
 
     st.divider()
@@ -213,13 +311,13 @@ if user_text:
         spinner_index = 0
         runtime_error = ""
 
-        worker_queue = queue.Queue()
-        worker = threading.Thread(
+        worker_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        worker_thread = threading.Thread(
             target=_stream_worker,
             args=(st.session_state.session_id, user_text, worker_queue),
             daemon=True,
         )
-        worker.start()
+        worker_thread.start()
 
         status_box.info(
             _build_live_status_text(
@@ -236,7 +334,7 @@ if user_text:
         stream_done = False
         while not stream_done:
             try:
-                event = worker_queue.get(timeout=0.20)
+                event = worker_queue.get(timeout=0.2)
             except queue.Empty:
                 if (time.time() - last_backend_event_at) > MAX_SILENCE_SECONDS:
                     runtime_error = f"后端超过 {MAX_SILENCE_SECONDS} 秒无更新，请稍后重试"
@@ -271,6 +369,7 @@ if user_text:
             if event_type == "meta":
                 doc_count = event.get("doc_count", 0)
                 current_stage_name = "会话初始化"
+                current_stage_start_at = time.time()
                 stage_mode = "已连接"
                 stage_extra = f"已连接后端，当前接入材料 {doc_count} 份"
                 spinner_index += 1
@@ -337,18 +436,18 @@ if user_text:
                     stage_extra = "上一阶段已完成，准备进入下一阶段..."
                 continue
 
-            if event_type == "token":
+            if event_type in {"token", "chunk", "assistant_token"}:
                 token = str(event.get("content", ""))
                 if token:
                     assistant_text += token
                     answer_box.markdown(assistant_text)
 
-                current_stage_name = "总结回复"
+                current_stage_name = "生成回复"
                 stage_mode = "输出中"
                 stage_extra = "正在逐字生成答案..."
                 continue
 
-            if event_type == "final":
+            if event_type in {"final", "done"}:
                 final_reply = str(event.get("assistant_reply", "")).strip()
                 if final_reply:
                     assistant_text = final_reply
@@ -359,12 +458,13 @@ if user_text:
                     final_state = payload_state
 
                 current_stage_name = "结果收尾"
+                current_stage_start_at = time.time()
                 stage_mode = "完成中"
                 stage_extra = "正在保存本轮状态..."
                 continue
 
-        if worker.is_alive():
-            worker.join(timeout=1.0)
+        if worker_thread.is_alive():
+            worker_thread.join(timeout=1.0)
 
         total_elapsed = _format_duration(time.time() - workflow_start_at)
 
@@ -379,7 +479,6 @@ if user_text:
             if not assistant_text.strip():
                 assistant_text = "抱歉，本轮没有生成有效回复。"
                 answer_box.markdown(assistant_text)
-
             status_box.success(f"✅ 本轮处理完成（总耗时 {total_elapsed}）")
 
     st.session_state.messages.append({"role": "assistant", "content": assistant_text})
